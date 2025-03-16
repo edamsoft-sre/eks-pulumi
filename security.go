@@ -1,13 +1,14 @@
 package main
 
 import (
+    "fmt"
+    "github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ec2"
     "github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
     "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
-// CreateNodeRole creates an IAM role for EKS node instances
-func CreateNodeRole(ctx *pulumi.Context) (*iam.Role, error) {
-    // Create the IAM role
+func CreateNodeResources(ctx *pulumi.Context) (*ec2.Vpc, *iam.Role, []pulumi.StringOutput, error) {
+    // Create IAM role
     nodeRole, err := iam.NewRole(ctx, "node-role", &iam.RoleArgs{
         AssumeRolePolicy: pulumi.String(`{
             "Version": "2012-10-17",
@@ -20,26 +21,69 @@ func CreateNodeRole(ctx *pulumi.Context) (*iam.Role, error) {
         Description: pulumi.String("IAM role for EKS node group"),
     })
     if err != nil {
-        return nil, err
+        ctx.Log.Error("Failed to create node role", &pulumi.LogArgs{})
+        return nil, nil, nil, err
     }
 
-    // Attach the AmazonEKSWorkerNodePolicy
-    _, err = iam.NewRolePolicyAttachment(ctx, "node-policy-eks-worker", &iam.RolePolicyAttachmentArgs{
+    _, err = iam.NewRolePolicyAttachment(ctx, ClusterName+"-eks-worker", &iam.RolePolicyAttachmentArgs{
         Role:      nodeRole.Name,
         PolicyArn: pulumi.String("arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"),
     })
     if err != nil {
-        return nil, err
+        ctx.Log.Error("Failed to attach EKS worker policy", &pulumi.LogArgs{})
+        return nil, nil, nil, err
     }
 
-    // Attach the AmazonEC2ContainerRegistryReadOnly policy
-    _, err = iam.NewRolePolicyAttachment(ctx, "node-policy-ecr-ro", &iam.RolePolicyAttachmentArgs{
+    _, err = iam.NewRolePolicyAttachment(ctx, ClusterName+"-ecr-ro", &iam.RolePolicyAttachmentArgs{
         Role:      nodeRole.Name,
         PolicyArn: pulumi.String("arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"),
     })
     if err != nil {
-        return nil, err
+        ctx.Log.Error("Failed to attach ECR policy", &pulumi.LogArgs{})
+        return nil, nil, nil, err
     }
 
-    return nodeRole, nil
+    // Create VPC
+    ctx.Log.Info("Creating VPC", nil)
+    vpc, err := ec2.NewVpc(ctx, "eks-vpc", &ec2.VpcArgs{
+        CidrBlock: pulumi.String("172.27.0.0/16"),
+    })
+    if err != nil {
+        ctx.Log.Error("Failed to create VPC", &pulumi.LogArgs{})
+        return nil, nil, nil, err
+    }
+
+    // Define subnet configurations
+    subnetConfigs := []struct {
+        cidr string
+        az   string
+    }{
+        {"172.27.0.0/27", "us-east-1a"},
+        {"172.27.0.32/27", "us-east-1b"},
+    }
+
+    // Create private subnets
+    privateSubnets := make([]pulumi.StringOutput, 0, len(subnetConfigs))
+    for i, config := range subnetConfigs {
+        name := fmt.Sprintf("%s-%d", ClusterName, i+1)
+        ctx.Log.Info(fmt.Sprintf("Creating subnet: %s with CIDR %s in AZ %s", name, config.cidr, config.az), nil)
+        subnet, err := ec2.NewSubnet(ctx, name, &ec2.SubnetArgs{
+            VpcId:            vpc.ID(),
+            CidrBlock:        pulumi.String(config.cidr),
+            AvailabilityZone: pulumi.String(config.az),
+        })
+        if err != nil {
+            ctx.Log.Error(fmt.Sprintf("Failed to create subnet %s", name), &pulumi.LogArgs{})
+            return nil, nil, nil, err
+        }
+        privateSubnets = append(privateSubnets, subnet.ID().ToStringOutput())
+    }
+
+    if len(privateSubnets) == 0 {
+        ctx.Log.Error("No subnets were created", nil)
+        return nil, nil, nil, fmt.Errorf("no subnets created")
+    }
+
+    ctx.Log.Info(fmt.Sprintf("Successfully created %d subnets", len(privateSubnets)), nil)
+    return vpc, nodeRole, privateSubnets, nil
 }
